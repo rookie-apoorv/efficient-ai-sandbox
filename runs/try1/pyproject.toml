@@ -1,0 +1,41 @@
+[project]
+name = "cs6013-compression"
+version = "0.1.0"
+description = "CS6013 Efficient AI - Qwen3.5-4B compression pipeline (compress / decompress / math eval)"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Dependencies must be CUDA 12.6 compatible (project spec, section 2.1).
+# torch >= 2.6 ships cu126 wheels; install them with:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+dependencies = [
+    "torch>=2.6",
+    "safetensors>=0.4.3",
+    "huggingface_hub>=0.26",
+    "numpy>=1.26",
+    "tqdm>=4.66",
+]
+
+# compress.py / decompress.py need ONLY the core dependencies above -- they work
+# directly on safetensors and never build a model. Everything needed to *run* the
+# model is an extra, so a grader can reproduce the checkpoint without installing
+# a transformers version that supports Qwen3.5.
+[project.optional-dependencies]
+eval = [
+    "transformers>=4.57",
+    "accelerate>=0.34",
+    "datasets>=2.20",
+]
+# Linear-attention kernels. Without these, Qwen3.5's 24 Gated DeltaNet layers
+# fall back to slow pure-PyTorch ops -- correct, but several times slower.
+fast = [
+    "causal-conv1d>=1.4",
+    "flash-linear-attention>=0.1",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["compression", "decompression", "evaluation"]
