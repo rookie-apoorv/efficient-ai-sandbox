@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cs6013-compression"
+version = "0.1.0"
+description = "Group-wise integer quantization for Qwen3.5-4B (Efficient AI CS6013)"
+requires-python = ">=3.10"
+
+# Pinned to the CUDA 12.6 wheel line. The pipeline itself is CPU-only, but the
+# environment must remain CUDA 12.6 compatible for downstream evaluation.
+dependencies = [
+    "torch==2.6.0",
+    "safetensors>=0.4.3",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# Only needed if you want to load the restored checkpoint for a sanity check.
+eval = [
+    "transformers>=4.51.0",
+]
+
+[tool.setuptools]
+packages = ["compression", "decompression"]
