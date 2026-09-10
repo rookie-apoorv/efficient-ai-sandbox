@@ -1,99 +1,81 @@
-"""Local checkpoint I/O.
-
-Nothing here instantiates a ``transformers`` model or touches the network: the
-base checkpoint is streamed tensor-by-tensor straight off disk.  That keeps peak
-memory at roughly one shard, works on a CPU-only node, and is immune to
-``vllm`` / ``transformers`` not yet registering the target architecture class.
-"""
+"""Reading the compressed repo and writing a standard Hugging Face checkpoint."""
 
 from __future__ import annotations
 
 import json
 import shutil
 from pathlib import Path
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, List
 
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-# Files that describe the model but are not weights; these must ride along so
-# the compressed repo is self-contained and the restored repo is loadable.
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".msgpack", ".h5", ".ckpt")
 _SKIP_NAMES = {
     "compression_config.json",
-    "model.safetensors.index.json",
-    "pytorch_model.bin.index.json",
     "compressed_model.safetensors.index.json",
+    "model.safetensors.index.json",
     ".gitattributes",
     "LICENSE",
     "NOTICE",
 }
-# Documentation, code and images are explicitly forbidden inside the submitted
-# Hugging Face checkpoint. Note that ``.txt`` is NOT skipped: Qwen tokenizers
-# ship ``merges.txt``, and dropping it would silently break the tokenizer.
-_SKIP_SUFFIXES = {
-    ".md",
-    ".ipynb",
-    ".py",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".svg",
-    ".log",
-    ".lock",
-}
+# ``.txt`` is deliberately absent: Qwen tokenizers ship ``merges.txt``.
+_SKIP_SUFFIXES = {".md", ".ipynb", ".py", ".png", ".jpg", ".jpeg", ".gif",
+                  ".svg", ".log", ".lock"}
 
 
-def resolve_checkpoint_dir(checkpoint_path: str | None, model_name: str) -> Path:
-    """Prefer an explicit local ``--checkpoint_path``, else treat the model name as a path."""
-    for candidate in (checkpoint_path, model_name):
-        if candidate:
-            path = Path(candidate).expanduser()
-            if path.is_dir():
-                return path
-    raise FileNotFoundError(
-        "No local checkpoint directory found. Pass --checkpoint_path pointing at "
-        "the downloaded base model directory (this pipeline never downloads "
-        "weights from the Hugging Face Hub)."
-    )
+class CompressedStore:
+    """Lazy, memory-mapped access to every tensor in the compressed shards."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = Path(directory)
+        self._handles = []
+        self._where: Dict[str, int] = {}
+
+        shards = sorted(self.directory.glob("*.safetensors"))
+        if not shards:
+            raise FileNotFoundError(f"No .safetensors shards found in {directory}")
+
+        for shard in shards:
+            handle = safe_open(str(shard), framework="pt", device="cpu")
+            idx = len(self._handles)
+            self._handles.append(handle)
+            for key in handle.keys():
+                self._where[key] = idx
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._where
+
+    def get(self, key: str) -> torch.Tensor:
+        if key not in self._where:
+            raise KeyError(f"'{key}' is missing from the compressed checkpoint")
+        return self._handles[self._where[key]].get_tensor(key)
+
+    def close(self) -> None:
+        for handle in self._handles:
+            try:
+                handle.__exit__(None, None, None)
+            except Exception:
+                pass
+        self._handles = []
 
 
-def list_weight_files(directory: Path) -> List[Path]:
-    files = sorted(directory.glob("*.safetensors"))
-    if files:
-        return files
-    files = sorted(directory.glob("*.bin"))
-    if files:
-        return files
-    raise FileNotFoundError(f"No .safetensors or .bin weight files found in {directory}")
-
-
-def iter_tensors(directory: Path) -> Iterator[Tuple[str, torch.Tensor]]:
-    """Yield ``(name, tensor)`` for every tensor in the checkpoint, in file order."""
-    for path in list_weight_files(directory):
-        if path.suffix == ".safetensors":
-            with safe_open(str(path), framework="pt", device="cpu") as handle:
-                for key in handle.keys():
-                    yield key, handle.get_tensor(key)
-        else:
-            shard = torch.load(str(path), map_location="cpu", weights_only=True)
-            for key, tensor in shard.items():
-                yield key, tensor
-            del shard
+def load_compression_config(directory: Path) -> dict:
+    path = Path(directory) / "compression_config.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found. --checkpoint_path must point at a directory "
+            "produced by compress.py."
+        )
+    return json.loads(path.read_text())
 
 
 def copy_auxiliary_files(src: Path, dst: Path) -> List[str]:
-    """Copy config / tokenizer / preprocessor files, never weights or docs.
-
-    The assignment forbids shipping READMEs, notebooks, logs or experiment
-    outputs inside the Hugging Face checkpoint, so those are filtered out while
-    everything needed to load the model is carried across.
-    """
+    """Carry config / tokenizer files across to the restored checkpoint."""
     copied: List[str] = []
     dst.mkdir(parents=True, exist_ok=True)
-    for item in sorted(src.iterdir()):
+    for item in sorted(Path(src).iterdir()):
         if not item.is_file():
             continue
         if item.suffix in _WEIGHT_SUFFIXES or item.name in _SKIP_NAMES:
@@ -106,13 +88,10 @@ def copy_auxiliary_files(src: Path, dst: Path) -> List[str]:
 
 
 class ShardedSafetensorsWriter:
-    """Accumulate tensors and flush them to size-bounded safetensors shards."""
+    """Write ``model.safetensors`` (+ index when sharded) for the restored model."""
 
     def __init__(
-        self,
-        out_dir: Path,
-        prefix: str,
-        max_shard_bytes: int = 4_000_000_000,
+        self, out_dir: Path, prefix: str = "model", max_shard_bytes: int = 4_000_000_000
     ) -> None:
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -122,8 +101,8 @@ class ShardedSafetensorsWriter:
         self._buffer: Dict[str, torch.Tensor] = {}
         self._buffer_bytes = 0
         self._shard_paths: List[Path] = []
-        self._weight_map: Dict[str, str] = {}
         self._pending_names: List[List[str]] = []
+        self._weight_map: Dict[str, str] = {}
         self.total_bytes = 0
 
     def add(self, name: str, tensor: torch.Tensor) -> None:
@@ -138,18 +117,17 @@ class ShardedSafetensorsWriter:
         if not self._buffer:
             return
         self._pending_names.append(list(self._buffer.keys()))
-        tmp_path = self.out_dir / f"{self.prefix}-part{len(self._pending_names):05d}.tmp"
-        save_file(self._buffer, str(tmp_path), metadata={"format": "pt"})
-        self._shard_paths.append(tmp_path)
+        tmp = self.out_dir / f"{self.prefix}-part{len(self._pending_names):05d}.tmp"
+        save_file(self._buffer, str(tmp), metadata={"format": "pt"})
+        self._shard_paths.append(tmp)
         self._buffer = {}
         self._buffer_bytes = 0
 
     def finalize(self) -> Dict[str, str]:
-        """Rename shards to their final names and write the index if sharded."""
         self._flush()
         n = len(self._shard_paths)
         if n == 0:
-            raise RuntimeError("nothing was written")
+            raise RuntimeError("no tensors were written")
 
         for i, tmp in enumerate(self._shard_paths):
             if n == 1:
@@ -165,7 +143,7 @@ class ShardedSafetensorsWriter:
                 "metadata": {"total_size": self.total_bytes},
                 "weight_map": self._weight_map,
             }
-            index_path = self.out_dir / f"{self.prefix}.safetensors.index.json"
-            index_path.write_text(json.dumps(index, indent=2))
-
+            (self.out_dir / f"{self.prefix}.safetensors.index.json").write_text(
+                json.dumps(index, indent=2)
+            )
         return self._weight_map
