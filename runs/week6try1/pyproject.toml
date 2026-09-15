@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cs6013-compression"
+version = "0.2.0"
+description = "GPTQ + group-wise integer quantization for Qwen3.5-4B (Efficient AI CS6013)"
+requires-python = ">=3.10"
+
+# CUDA 12.6 wheel line. decompress.py is CPU-only; compress.py --method gptq
+# wants a GPU but will run on CPU if you are patient.
+dependencies = [
+    "torch==2.6.0",
+    "safetensors>=0.4.3",
+    "numpy>=1.24",
+    "transformers>=4.51.0",
+]
+
+[project.optional-dependencies]
+calib = ["datasets>=2.18.0"]
+
+[tool.setuptools]
+packages = ["compression", "decompression"]
