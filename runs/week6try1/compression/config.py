@@ -51,6 +51,29 @@ HESSIAN_BUDGET_GB = 8.0  # cap on concurrent Hessians; lower this if you OOM
 DEVICE = "auto"          # "auto" | "cuda" | "cpu"
 
 # --------------------------------------------------------------------------
+# Domain pruning
+# --------------------------------------------------------------------------
+# The evaluation is text-only maths, so the vision tower is never invoked. Any
+# tensor having one of these as a dotted name component is reconstructed as
+# zeros instead of being stored: it costs ~0 bytes in the checkpoint, the key
+# still exists so strict loading succeeds, and the freed budget is handed to the
+# planner, which spends it promoting text weights from int4 to int8.
+#
+# Matching is on whole dotted components, never substrings, so a language-model
+# key can never be caught by accident. compress.py prints every dropped tensor
+# and the total saving -- read that list before uploading.
+#
+# Set to () to disable and store the vision tower normally.
+DROP_COMPONENTS = (
+    "visual",
+    "vision_tower",
+    "vision_model",
+    "video_tower",
+    "image_newline",
+    "multi_modal_projector",
+)
+
+# --------------------------------------------------------------------------
 # Calibration
 # --------------------------------------------------------------------------
 # Bundled calibration corpus, built once by compression/build_calibration_set.py
@@ -59,7 +82,7 @@ DEVICE = "auto"          # "auto" | "cuda" | "cpu"
 CALIB_FILE = Path(__file__).parent / "calib_data" / "math_calib.jsonl"
 
 CALIB_SEQLEN = 2048
-CALIB_SAMPLES = 0        # 0 = size automatically from the MoE routing fan-out
+CALIB_SAMPLES = 0        # 0 = size automatically (floored at MIN_CALIB_SEQUENCES)
 CALIB_SEED = 0
 USE_CHAT_TEMPLATE = True # match the chat-formatted distribution used at eval
 

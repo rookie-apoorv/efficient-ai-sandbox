@@ -17,6 +17,8 @@ import argparse
 import time
 from pathlib import Path
 
+import torch
+
 from decompression import SUPPORTED_FORMATS
 from decompression.dequantize import restore_tensor
 from decompression.io_utils import (
@@ -58,9 +60,18 @@ def convert_to_hf_checkpoint(
 
     n_done = 0
     t0 = time.time()
+    n_zeroed = 0
     for name, meta in config["tensors"].items():
         if meta["mode"] == "raw":
             writer.add(name, store.get(name))
+        elif meta["mode"] == "zeros":
+            # Stored as shape + dtype only. The key must still exist or strict
+            # loading of the restored checkpoint fails.
+            writer.add(
+                name,
+                torch.zeros(tuple(meta["shape"]), dtype=getattr(torch, meta["dtype"])),
+            )
+            n_zeroed += 1
         else:
             perm_key = f"{name}::perm"
             writer.add(
@@ -82,6 +93,8 @@ def convert_to_hf_checkpoint(
 
     copied = copy_auxiliary_files(src, out)
     print(f"[decompress] copied config/tokenizer files: {', '.join(copied)}")
+    if n_zeroed:
+        print(f"[decompress] {n_zeroed} tensors reconstructed as zeros (pruned subsystem)")
     print(
         f"[decompress] done. restored {n_done} tensors, "
         f"{writer.total_bytes / 2**30:.3f} GiB written to {out}"

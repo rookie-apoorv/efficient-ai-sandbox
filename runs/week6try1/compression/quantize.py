@@ -209,6 +209,18 @@ def quantized_nbytes(rows: int, cols: int, bits: int, group_size: int) -> int:
     return code_bytes + rows * ng * 2 + rows * ng  # codes + fp16 scales + uint8 zps
 
 
+def should_drop(name: str, drop_components) -> bool:
+    """True if a tensor belongs to a subsystem the target domain never uses.
+
+    Matching is on whole dotted name components, so ``visual`` catches
+    ``model.visual.blocks.0.attn.qkv.weight`` but nothing in the language tower
+    can collide with it. Substring matching would be unsafe here.
+    """
+    if not drop_components:
+        return False
+    return bool(set(name.split(".")) & set(drop_components))
+
+
 def is_quantizable(tensor: torch.Tensor, group_size: int, min_numel: int) -> bool:
     if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return False

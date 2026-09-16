@@ -32,15 +32,29 @@ from typing import List, Optional
 import torch
 
 
+# The GPTQ paper and every mainstream implementation calibrate on 128 sequences
+# of 2048 tokens. Enough data to make the Hessian well conditioned is the floor,
+# not the target: past that point more calibration keeps helping, with
+# diminishing returns, and it is cheap relative to the quantization itself.
+MIN_CALIB_SEQUENCES = 128
+
+
 def suggest_n_samples(
     n_experts: int, top_k: int, hessian_dim: int, seqlen: int, oversample: int = 4
 ) -> int:
-    """Sequences needed so the average expert sees ~``oversample`` x its dimension."""
+    """Sequences needed so the average expert sees ~``oversample`` x its dimension.
+
+    For a dense model this is just ``oversample * hessian_dim`` tokens, which is
+    a conditioning floor rather than a quality target -- hence the
+    ``MIN_CALIB_SEQUENCES`` floor. For an MoE model each expert only receives
+    ``top_k / n_experts`` of the tokens, so the requirement scales up by the
+    inverse of the routing fan-out.
+    """
     if n_experts <= 1 or top_k <= 0:
         tokens = oversample * hessian_dim
     else:
         tokens = oversample * hessian_dim * n_experts / top_k
-    return max(8, math.ceil(tokens / seqlen))
+    return max(MIN_CALIB_SEQUENCES, math.ceil(tokens / seqlen))
 
 
 def _load_texts_from_file(path: Path) -> List[str]:

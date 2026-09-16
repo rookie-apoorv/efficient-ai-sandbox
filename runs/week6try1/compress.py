@@ -39,17 +39,29 @@ from compression.quantize import (
     is_quantizable,
     quantize_tensor_rtn,
     quantized_nbytes,
+    should_drop,
 )
 
 
 def build_plan(base_dir: Path):
     """Pass 1: size and sensitivity of every tensor, read straight off disk."""
     candidates, fixed_bytes, original_bytes, seen = [], 0, 0, 0
+    dropped, dropped_bytes = [], 0
     t0 = time.time()
 
     for name, tensor in iter_tensors(base_dir):
         seen += 1
-        original_bytes += tensor.numel() * tensor.element_size()
+        nbytes = tensor.numel() * tensor.element_size()
+        original_bytes += nbytes
+
+        # Dropped tensors still count in the denominator -- they are part of the
+        # original model -- but contribute nothing to the compressed size and are
+        # excluded from the planner so their budget goes to the text weights.
+        if should_drop(name, config.DROP_COMPONENTS):
+            dropped.append((name, nbytes))
+            dropped_bytes += nbytes
+            del tensor
+            continue
 
         if not is_quantizable(tensor, config.GROUP_SIZE, config.MIN_NUMEL):
             fixed_bytes += tensor.numel() * tensor.element_size()
@@ -74,6 +86,23 @@ def build_plan(base_dir: Path):
         if seen % 200 == 0:
             print(f"  scanned {seen} tensors ({time.time() - t0:.0f}s)", flush=True)
         del tensor
+
+    if dropped:
+        by_root = {}
+        for nm, nb in dropped:
+            by_root[nm.split(".")[0] if "." in nm else nm] = by_root.get(
+                nm.split(".")[0] if "." in nm else nm, 0
+            ) + nb
+        print(
+            f"\n[compress] dropping {len(dropped)} tensors "
+            f"({dropped_bytes / 2**30:.3f} GiB, "
+            f"{dropped_bytes / max(original_bytes, 1) * 100:.1f}% of the checkpoint) "
+            "-> restored as zeros"
+        )
+        for root, nb in sorted(by_root.items(), key=lambda kv: -kv[1]):
+            print(f"    {root + '.*':<32} {nb / 2**20:9.1f} MiB")
+        print(f"    first dropped key: {dropped[0][0]}")
+        print("    CHECK THIS LIST -- anything here is zeroed in the restored model.\n")
 
     bits_by_name, projected = plan_bit_widths(
         candidates,
@@ -205,7 +234,18 @@ def write_compressed(
     tensor_meta, n_gptq, n_rtn, n_raw = {}, 0, 0, 0
     t0 = time.time()
 
+    n_dropped = 0
     for name, tensor in iter_tensors(base_dir):
+        if should_drop(name, config.DROP_COMPONENTS):
+            tensor_meta[name] = {
+                "mode": "zeros",
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype).replace("torch.", ""),
+            }
+            n_dropped += 1
+            del tensor
+            continue
+
         result: QuantResult | None = gptq_payloads.get(name)
         if result is not None:
             n_gptq += 1
@@ -256,6 +296,8 @@ def write_compressed(
         "n_gptq_tensors": n_gptq,
         "n_rtn_tensors": n_rtn,
         "n_raw_tensors": n_raw,
+        "n_dropped_tensors": n_dropped,
+        "drop_components": list(config.DROP_COMPONENTS),
         "original_total_bytes": original_bytes,
         "compressed_total_bytes": writer.total_bytes,
         "achieved_ratio": writer.total_bytes / max(original_bytes, 1),
@@ -302,7 +344,8 @@ def convert_from_hf_checkpoint(
     print(f"[compress] copied config/tokenizer files: {', '.join(copied)}")
     print(
         f"[compress] done. {compressed['n_gptq_tensors']} GPTQ / "
-        f"{compressed['n_rtn_tensors']} RTN / {compressed['n_raw_tensors']} lossless, "
+        f"{compressed['n_rtn_tensors']} RTN / {compressed['n_raw_tensors']} lossless / "
+        f"{compressed['n_dropped_tensors']} zeroed, "
         f"{compressed['compressed_total_bytes'] / 2**30:.3f} GiB, "
         f"ratio {compressed['achieved_ratio']:.4f}"
     )
