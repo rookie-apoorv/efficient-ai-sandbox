@@ -34,7 +34,12 @@ import torch
 import torch.nn as nn
 
 from compression.gptq import GPTQQuantizer
-from compression.modelscan import chunk_by_memory, find_decoder_layers, linear_targets
+from compression.modelscan import (
+    chunk_by_memory,
+    find_decoder_layers,
+    linear_targets,
+    make_key_resolver,
+)
 from compression.quantize import QuantResult
 
 
@@ -130,6 +135,7 @@ def gptq_quantize_model(
     """GPTQ every reachable linear. Returns payloads keyed by state-dict name."""
     layers_attr, layers = find_decoder_layers(model)
     model.config.use_cache = False
+    resolve_key = make_key_resolver(bits_by_name.keys())
 
     hidden, layer_kwargs = capture_layer0_inputs(model, layers, samples, device)
     if verbose:
@@ -144,13 +150,29 @@ def gptq_quantize_model(
 
     for layer_idx, layer in enumerate(layers):
         layer.to(device)
-        targets = linear_targets(layer, group_size, min_numel)
-        # Only quantize what the planner actually assigned a bit width to.
-        targets = {
-            n: m
-            for n, m in targets.items()
-            if f"{layers_attr}.{layer_idx}.{n}.weight" in bits_by_name
-        }
+        found = linear_targets(layer, group_size, min_numel)
+        # Map each live module to its checkpoint key. The two differ whenever the
+        # checkpoint nests the language tower under a prefix the loaded model
+        # does not expose, which is the normal case for multimodal checkpoints.
+        targets, keys = {}, {}
+        for mod_name, module in found.items():
+            key = resolve_key(layers_attr, layer_idx, mod_name)
+            if key is not None:
+                targets[mod_name] = module
+                keys[mod_name] = key
+
+        if layer_idx == 0 and found and not targets:
+            sample_ckpt = sorted(bits_by_name.keys())[:5]
+            raise RuntimeError(
+                "GPTQ found "
+                f"{len(found)} quantizable linears in layer 0 but could not match "
+                "any of them to a checkpoint tensor, so nothing would be "
+                "quantized.\n"
+                f"  module path built : {layers_attr}.0.{next(iter(found))}.weight\n"
+                f"  checkpoint keys   : {sample_ckpt}\n"
+                "The loaded module paths and the checkpoint key names disagree. "
+                "Report this with the two lines above."
+            )
 
         if targets:
             for chunk in chunk_by_memory(targets, hessian_budget_bytes):
@@ -175,7 +197,7 @@ def gptq_quantize_model(
 
                 for name in chunk:
                     module = targets[name]
-                    full = f"{layers_attr}.{layer_idx}.{name}.weight"
+                    full = keys[name]
                     result, dequantized = quantizers[name].quantize(
                         module.weight,
                         bits=bits_by_name[full],

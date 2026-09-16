@@ -107,21 +107,41 @@ def run_gptq(base_dir: Path, bits_by_name: dict) -> dict:
     for param in model.parameters():
         param.requires_grad_(False)
 
-    print(format_coverage(coverage_report(model, config.GROUP_SIZE, config.MIN_NUMEL)))
+    print(
+        format_coverage(
+            coverage_report(
+                model, config.GROUP_SIZE, config.MIN_NUMEL, ckpt_keys=bits_by_name.keys()
+            )
+        )
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(str(base_dir), trust_remote_code=True)
 
     n_samples = config.CALIB_SAMPLES
     if n_samples <= 0:
         cfg = model.config
+        def _cfg(*names, default=None):
+            for nm in names:
+                val = getattr(cfg, nm, None)
+                if val:
+                    return val
+            return default
+
+        _n_experts = _cfg("num_experts", "n_routed_experts", "num_local_experts",
+                          "num_routed_experts", default=1)
+        _top_k = _cfg("num_experts_per_tok", "num_experts_per_token",
+                      "moe_top_k", "top_k", default=1)
+        _dim = _cfg("moe_intermediate_size", "intermediate_size",
+                    "hidden_size", default=2048)
         n_samples = suggest_n_samples(
-            n_experts=getattr(cfg, "num_experts", 1) or 1,
-            top_k=getattr(cfg, "num_experts_per_tok", 1) or 1,
-            hessian_dim=getattr(cfg, "moe_intermediate_size", None)
-            or getattr(cfg, "hidden_size", 2048),
+            n_experts=_n_experts, top_k=_top_k, hessian_dim=_dim,
             seqlen=config.CALIB_SEQLEN,
         )
-        print(f"[compress] auto-selected {n_samples} calibration sequences")
+        print(
+            f"[compress] auto-selected {n_samples} calibration sequences "
+            f"({n_samples * config.CALIB_SEQLEN / 1000:.0f}K tokens; "
+            f"experts={_n_experts}, top_k={_top_k}, hessian_dim={_dim})"
+        )
 
     samples = build_calibration(
         tokenizer,
@@ -156,6 +176,13 @@ def run_gptq(base_dir: Path, bits_by_name: dict) -> dict:
         mse=config.MSE_CLIPPING,
     )
 
+    if not payloads:
+        raise RuntimeError(
+            "GPTQ produced zero quantized tensors. Writing the checkpoint now "
+            "would silently ship an RTN model labelled as GPTQ. Check the "
+            "coverage report above for UNRESOLVED targets, or set "
+            "METHOD = 'rtn' in compression/config.py if that is what you want."
+        )
     print(f"[compress] GPTQ produced {len(payloads)} quantized tensors")
     del model, tokenizer, samples
     gc.collect()

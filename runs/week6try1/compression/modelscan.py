@@ -76,6 +76,35 @@ def find_fused_expert_params(layer: nn.Module) -> Dict[str, torch.Tensor]:
     return out
 
 
+def make_key_resolver(ckpt_keys):
+    """Map a live module path to the name that weight has in the checkpoint file.
+
+    These are not always the same string. Multimodal checkpoints store the
+    language tower under its own prefix (``model.language_model.layers.0...``)
+    while ``AutoModelForCausalLM`` exposes the loaded module at
+    ``model.layers.0...``. Building the checkpoint key by concatenating the live
+    module path therefore produces a name that matches nothing, and every target
+    gets silently dropped.
+
+    Matching on the ``layers.<i>.<module>.weight`` suffix is prefix-agnostic and
+    still unambiguous: the leading dot anchors the match, so ``layers.1.`` never
+    matches ``layers.11.``. A suffix that resolves to two or more checkpoint keys
+    is treated as unresolved rather than guessed at.
+    """
+    keys = list(ckpt_keys)
+    key_set = set(keys)
+
+    def resolve(layers_attr: str, layer_idx: int, module_name: str):
+        direct = f"{layers_attr}.{layer_idx}.{module_name}.weight"
+        if direct in key_set:
+            return direct
+        tail = f".layers.{layer_idx}.{module_name}.weight"
+        matches = [k for k in keys if k.endswith(tail)]
+        return matches[0] if len(matches) == 1 else None
+
+    return resolve
+
+
 def hessian_bytes(module: nn.Linear) -> int:
     """float32 Hessian footprint for one linear: in_features^2 * 4."""
     return module.in_features * module.in_features * 4
@@ -107,21 +136,43 @@ def chunk_by_memory(
 
 
 def coverage_report(
-    model: nn.Module, group_size: int, min_numel: int
+    model: nn.Module, group_size: int, min_numel: int, ckpt_keys=None
 ) -> dict:
-    """Pre-flight: how much of the model will GPTQ actually touch?"""
+    """Pre-flight: how much of the model will GPTQ actually touch?
+
+    When ``ckpt_keys`` is supplied the report counts only targets whose weights
+    can be resolved back to a checkpoint key -- that is, the tensors that will
+    genuinely be quantized. Counting modules that are merely *present* is
+    misleading: it reports high coverage right up until the run quantizes
+    nothing at all.
+    """
     layers_name, layers = find_decoder_layers(model)
+    resolve = make_key_resolver(ckpt_keys) if ckpt_keys is not None else None
 
     total_params = sum(p.numel() for p in model.parameters())
     gptq_params = 0
     fused_params = 0
     n_linears = 0
+    n_unresolved = 0
     max_hessian = 0
+    unresolved_examples = []
+    resolved_examples = []
 
-    for layer in layers:
+    for layer_idx, layer in enumerate(layers):
         targets = linear_targets(layer, group_size, min_numel)
-        n_linears += len(targets)
-        for module in targets.values():
+        for mod_name, module in targets.items():
+            if resolve is not None:
+                key = resolve(layers_name, layer_idx, mod_name)
+                if key is None:
+                    n_unresolved += 1
+                    if len(unresolved_examples) < 3:
+                        unresolved_examples.append(
+                            f"{layers_name}.{layer_idx}.{mod_name}.weight"
+                        )
+                    continue
+                if len(resolved_examples) < 3:
+                    resolved_examples.append(key)
+            n_linears += 1
             gptq_params += module.weight.numel()
             max_hessian = max(max_hessian, hessian_bytes(module))
         for param in find_fused_expert_params(layer).values():
@@ -135,6 +186,9 @@ def coverage_report(
         "layers_attr": layers_name,
         "n_layers": len(layers),
         "n_linear_targets_per_layer": n_linears // max(len(layers), 1),
+        "n_unresolved": n_unresolved,
+        "unresolved_examples": unresolved_examples,
+        "resolved_examples": resolved_examples,
         "total_params": total_params,
         "gptq_params": gptq_params,
         "fused_expert_params": fused_params,
@@ -162,8 +216,15 @@ def format_coverage(report: dict) -> str:
         f"  embeddings / lm_head    : {report['embedding_params'] / 1e9:8.3f} B "
         f"(RTN, gather not GEMM)",
         f"  largest Hessian         : {report['largest_hessian_bytes'] / 2**20:8.1f} MiB",
-        "=" * 72,
     ]
+    if report.get("resolved_examples"):
+        lines.append(f"  example key resolved    : {report['resolved_examples'][0]}")
+    if report.get("n_unresolved"):
+        lines.append(
+            f"  UNRESOLVED targets      : {report['n_unresolved']} "
+            f"(e.g. {report['unresolved_examples'][0]})"
+        )
+    lines.append("=" * 72)
     if cov < 0.40:
         lines += [
             "  WARNING: GPTQ reaches under 40% of the parameters. The experts are",
