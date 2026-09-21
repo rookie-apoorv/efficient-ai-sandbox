@@ -1,0 +1,44 @@
+[project]
+name = "cs6013-compression"
+version = "0.2.0"
+description = "GPTQ + group-wise integer quantization for Qwen3.5-4B (Efficient AI CS6013)"
+requires-python = ">=3.10"
+
+# Kept deliberately small. The graders run `uv sync` here and then execute
+# decompress.py with the resulting interpreter, so every dependency listed is a
+# way for step 3_venv to fail on a machine we do not control. decompress.py
+# imports only torch and safetensors; transformers is needed by compress.py
+# alone and lives in an extra.
+#
+# torch is a RANGE, not a pin. An exact pin drags in exactly one nvidia-cudnn
+# build, and if the resolver's first index does not carry that build the whole
+# resolution fails even though several perfectly good torch versions are
+# available. Any torch from 2.4 on runs this codec; let the resolver choose one
+# that fits the grading node's Python and CUDA wheels.
+dependencies = [
+    "torch>=2.4",
+    "safetensors>=0.4.3",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# Only needed to RUN compress.py, never to decompress a published checkpoint.
+compress = [
+    "transformers>=4.51.0",
+    "datasets>=2.18.0",
+]
+
+[tool.uv]
+# Scripts, not a distributable package: do not try to build/install this project.
+# compress.py and decompress.py import compression/ and decompression/ from the
+# working directory, which is where both entry points are run from.
+package = false
+
+# The pytorch wheel indexes and PyPI both carry nvidia-* packages at different
+# version sets. Without this, uv considers only the first index that mentions a
+# package and refuses an otherwise valid solve. The course eval harness sets the
+# same option for the same reason.
+index-strategy = "unsafe-best-match"
+
+# torch publishes linux wheels only for the CUDA builds this course targets.
+environments = ["sys_platform == 'linux'"]
