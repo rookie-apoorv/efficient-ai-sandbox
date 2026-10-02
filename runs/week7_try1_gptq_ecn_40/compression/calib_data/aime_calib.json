@@ -1,0 +1,11 @@
+{
+  "source_samples": 600,
+  "source_problems": 150,
+  "gptq_sequences": 118,
+  "gptq_tokens": 2019883,
+  "gptq_problems": 98,
+  "gptq_max_len": 32081,
+  "fisher_sequences": 256,
+  "fisher_tokens": 1048576,
+  "sha256": "9f06ba5cfb43e597d7f00e220724788c57caf56c89d40995e9bbcd1192a38830"
+}
